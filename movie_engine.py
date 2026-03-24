@@ -7,17 +7,26 @@ class MovieEngine:
         self.api_key = TMDB_API_KEY
         self.base_url = "https://api.themoviedb.org/3"
 
-    async def buscar_item(self, session, nombre, tipo):
-        url = f"{self.base_url}/search/{tipo}"
-        params = {'api_key': self.api_key, 'query': nombre, 'language': 'es-ES'}
-        async with session.get(url, params=params) as resp:
-            data = await resp.json()
-            return data['results'][0] if data.get('results') else None
+    async def descubrir_contenido(self, session, tipo, genero_id, es_animado, es_doc=False):
+        url = f"{self.base_url}/discover/{tipo}"
+        
+        # Construcción de la lista de géneros
+        lista_generos = [str(genero_id)]
+        
+        if es_doc:
+            lista_generos.append("99") # Obligamos a que sea Documental
+        if es_animado:
+            lista_generos.append("16") # Obligamos a que sea Animación
 
-    async def obtener_muchas_recs(self, session, item_id, tipo):
-        """Trae más resultados para tener de dónde filtrar"""
-        url = f"{self.base_url}/{tipo}/{item_id}/recommendations"
-        params = {'api_key': self.api_key, 'language': 'es-ES'}
+        params = {
+            'api_key': self.api_key,
+            'language': 'es-ES',
+            'sort_by': 'popularity.desc',
+            'with_genres': ",".join(lista_generos),
+            'page': 1,
+            'vote_count.gte': 100 # Filtramos para que salgan cosas de calidad
+        }
+        
         async with session.get(url, params=params) as resp:
             data = await resp.json()
-            return data.get('results', []) # Traemos los 20 resultados de la primera página
+            return data.get('results', [])
