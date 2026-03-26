@@ -15,7 +15,7 @@ db = MovieDB()
 estados_usuarios = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicio del bot y reinicio de estados"""
+    """Inicio del bot. Siempre envía mensaje nuevo para mantener historial."""
     user = update.effective_user
     await db.registrar_usuario(user.id, user.first_name)
     
@@ -28,10 +28,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎞️ Documentales", callback_data='p1_doc')]
     ]
     
-    texto = f"✨ ¡Hola, *{user.first_name}*! ✨\n¿Qué aventura quieres vivir hoy? 🍿"
+    texto = f"✨ *Nueva Búsqueda* ✨\n¿Qué quieres ver ahora, {user.first_name}? 🍿"
     
-    # MEJORA: Si viene de un botón (callback), enviamos un mensaje nuevo. 
-    # Telegram no permite editar un mensaje con foto para convertirlo en texto.
+    # MEJORA: Siempre usamos reply_text para que sea un mensaje nuevo.
+    # Así la recomendación anterior se queda guardada arriba.
     if update.callback_query:
         await update.callback_query.message.reply_text(texto, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     else:
@@ -42,13 +42,13 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
     
-    # Answer siempre al inicio
     await query.answer()
 
-    # Lógica de reinicio: borramos el mensaje anterior para limpiar el chat
+    # MEJORA HISTORIAL: Quitamos los botones del mensaje viejo y lanzamos uno nuevo
     if data == 'reset_game':
         try:
-            await query.message.delete()
+            # Quitamos los botones de la recomendación anterior para no confundir
+            await query.edit_message_reply_markup(reply_markup=None)
         except:
             pass
         await start(update, context)
@@ -88,7 +88,7 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith('p3_') or data.startswith('p4_'):
         estado['genero_id'] = int(data.split('_')[1])
-        await query.edit_message_text("🔮 *Consultando múltiples fuentes en paralelo...*", parse_mode='Markdown')
+        await query.edit_message_text("🔮 *Consultando múltiples fuentes...*", parse_mode='Markdown')
         await context.bot.send_chat_action(chat_id=user_id, action=constants.ChatAction.TYPING)
         await enviar_resultado(query, user_id, estado)
 
@@ -104,16 +104,13 @@ async def enviar_resultado(query, user_id, estado):
         
         if not res:
             btn_error = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Reintentar", callback_data='reset_game')]])
-            await query.message.reply_text("😔 No encontré resultados. ¡Prueba otra categoría!", reply_markup=btn_error)
+            await query.message.reply_text("😔 No encontré resultados.", reply_markup=btn_error)
             return
 
         item = random.choice(res[:12])
         titulo = item.get('title') or item.get('name') or "Desconocido"
         
-        # Concurrencia para OMDb
         tarea_ratings = engine.obtener_ratings_omdb(session, titulo)
-        
-        # Link de YouTube
         busqueda_yt = f"{titulo} trailer oficial español".replace(" ", "+")
         url_youtube = f"https://www.youtube.com/results?search_query={busqueda_yt}"
         
@@ -152,7 +149,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(procesar_callback))
     
-    print("---------------------------------------")
-    print("🚀 Bot Maestro de Cine Activo")
-    print("---------------------------------------")
+    print("🚀 Bot con Historial Activo")
     app.run_polling(drop_pending_updates=True)

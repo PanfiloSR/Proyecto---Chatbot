@@ -15,9 +15,11 @@ class MovieEngine:
 
         if tipo == 'tv':
             mapeo_tv = {
-                27: 9648,   
-                878: 10765,
-                28: 10759,  
+        14: 10765,  # Fantasía (Cine 14 -> TV 10765)
+                878: 10765, # Sci-Fi (Cine 878 -> TV 10765)
+                28: 10759,  # Acción (Cine 28 -> TV 10759)
+                12: 10759,  # Aventura (Cine 12 -> TV 10759)
+                27: 9648,   # Terror (Cine 27 -> TV 9648 - Misterio)
             }
             genero_id = mapeo_tv.get(genero_id, genero_id)
         
