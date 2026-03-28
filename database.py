@@ -2,6 +2,8 @@
 import sqlite3
 import asyncio
 
+#ACCEDE A TELEGRAM Y DA EL NOMBRE
+
 class MovieDB:
     def __init__(self):
         self.lock = asyncio.Lock() # Mecanismo de Sincronización
