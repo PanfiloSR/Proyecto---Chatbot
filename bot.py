@@ -9,19 +9,17 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_TOKEN
-from movie_engine import (
-    MovieEngine, crear_sesion,
-    GENEROS_MOVIE, TEMATICAS_DOC,
-)
+from movie_engine import MovieEngine, crear_sesion, GENEROS_MOVIE, TEMATICAS_DOC
 
+# Al inicio del archivo bot.py, cambia:
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG,  # Cambiado de INFO a DEBUG
 )
 log = logging.getLogger(__name__)
 
 engine  = MovieEngine()
-estados = {}
+estados = {}   # { user_id: dict }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -35,8 +33,7 @@ def _kb(filas: list) -> InlineKeyboardMarkup:
         if isinstance(fila[0], tuple):
             resultado.append([InlineKeyboardButton(t, callback_data=d) for t, d in fila])
         else:
-            # ya son InlineKeyboardButton
-            resultado.append(fila)
+            resultado.append(fila)   # ya son InlineKeyboardButton
     return InlineKeyboardMarkup(resultado)
 
 BTN_INICIO = [("🏠 Menú principal", "inicio")]
@@ -112,6 +109,7 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 BTN_INICIO,
             ])
         )
+        return
 
     elif data in ("desc_formato_movie", "desc_formato_tv"):
         tipo = "movie" if data == "desc_formato_movie" else "tv"
@@ -124,6 +122,7 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 BTN_INICIO,
             ])
         )
+        return
 
     elif data == "desc_formato_doc":
         estado.update({"tipo": "movie", "es_doc": True, "es_animado": False})
@@ -132,6 +131,7 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filas.append(BTN_INICIO)
         await q.edit_message_text("🎞️ ¿Qué temática te interesa?",
                                    reply_markup=_kb(filas))
+        return
 
     elif data in ("desc_visual_anim", "desc_visual_live"):
         estado["es_animado"] = (data == "desc_visual_anim")
@@ -139,6 +139,7 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎭 ¿Qué género prefieres?",
             reply_markup=_teclado_generos("desc_genero", GENEROS_MOVIE, excluir={16, 99})
         )
+        return
 
     elif data.startswith("desc_genero_"):
         genero_id = int(data.split("_")[2])
@@ -163,38 +164,20 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await _enviar_tarjeta(q, random.choice(res[:12]),
                               estado.get("tipo", "movie"))
+        return
 
     # ══════════════════════════════════════════════════════════════════════════
-    # RAMA 2 — SIMILITUD
+    # RAMA 2 — SIMILITUD (NUEVA VERSIÓN CON SELECCIÓN)
     # ══════════════════════════════════════════════════════════════════════════
     elif data == "inicio_similar":
         estado.update({"rama": "similar", "paso": "esperando_titulo"})
         await q.edit_message_text(
             "🎬 *¿Qué has visto recientemente?*\n\n"
-            "Escribe el nombre de la película o serie que te gustó 👇",
+            "Escribe el nombre de la película o serie que te gustó "
+            "y buscaré contenido similar por palabras clave 🏷️",
             parse_mode="Markdown"
         )
-
-    elif data.startswith("similar_elegir_"):
-        # formato: similar_elegir_<tipo>_<tmdb_id>
-        partes  = data.split("_")          # ['similar','elegir','tipo','id']
-        tipo    = partes[2]
-        tmdb_id = int(partes[3])
-        estado.update({"similar_tipo": tipo, "similar_id": tmdb_id})
-        await q.edit_message_text("🎯 *Buscando recomendaciones...*",
-                                   parse_mode="Markdown")
-        await context.bot.send_chat_action(chat_id=user_id,
-                                           action=constants.ChatAction.TYPING)
-        async with crear_sesion() as session:
-            res = await engine.obtener_recomendaciones(session, tipo, tmdb_id)
-        if not res:
-            await q.message.reply_text(
-                "😔 TMDB no tiene recomendaciones para ese título aún.",
-                reply_markup=_kb([[("🔄 Buscar otro", "inicio_similar")], BTN_INICIO])
-            )
-            return
-        top = max(res[:12], key=lambda x: x.get("vote_average", 0))
-        await _enviar_tarjeta(q, top, tipo)
+        return
 
     elif data == "similar_ir_descubrir":
         estado.update({"rama": "descubrir"})
@@ -207,6 +190,70 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 BTN_INICIO,
             ])
         )
+        return
+
+    # Nueva sección: Selección de título de la lista de candidatos
+    elif data.startswith("similar_sel_"):
+        parts = data.split("_")
+        tmdb_id = int(parts[2])
+        tipo = parts[3]  # movie o tv
+        
+        await q.edit_message_text(
+            f"🎬 *Procesando selección...*\n\nBuscando recomendaciones basadas en tu elección.",
+            parse_mode="Markdown"
+        )
+        
+        await context.bot.send_chat_action(chat_id=user_id,
+                                           action=constants.ChatAction.TYPING)
+        
+        async with crear_sesion() as session:
+            resultado = await engine.recomendar_por_id(session, tmdb_id, tipo)
+        
+        if not resultado:
+            await q.message.reply_text(
+                "😔 No pude encontrar recomendaciones para esta película/serie.",
+                reply_markup=_kb([BTN_INICIO])
+            )
+            return
+        
+        semilla = resultado["semilla"]
+        recs = resultado["recomendaciones"]
+        
+        # Enviar confirmación
+        await q.message.reply_text(
+            f"✅ Basándome en *{semilla['titulo']}* ({semilla['anio']})\n"
+            f"aquí tienes 3 recomendaciones por palabras clave 🏷️:",
+            parse_mode="Markdown"
+        )
+        
+        # Enviar recomendaciones
+        for item in recs:
+            async with crear_sesion() as session:
+                tarjeta = await engine.construir_tarjeta(session, item, tipo)
+            teclado = _kb([
+                [InlineKeyboardButton("📺 Ver tráiler", url=tarjeta["url_yt"])],
+                [("🔄 Nueva búsqueda", "inicio")],
+            ])
+            try:
+                if tarjeta["poster_url"]:
+                    await q.message.reply_photo(
+                        photo=tarjeta["poster_url"],
+                        caption=tarjeta["texto"],
+                        parse_mode="Markdown",
+                        reply_markup=teclado,
+                    )
+                else:
+                    await q.message.reply_text(
+                        tarjeta["texto"], parse_mode="Markdown",
+                        reply_markup=teclado
+                    )
+            except Exception as e:
+                log.warning("reply_photo falló (%s), usando texto", e)
+                await q.message.reply_text(
+                    tarjeta["texto"], parse_mode="Markdown",
+                    reply_markup=teclado
+                )
+        return
 
     # ══════════════════════════════════════════════════════════════════════════
     # RAMA 3 — TALENTO
@@ -218,6 +265,7 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Escribe su nombre 👇",
             parse_mode="Markdown"
         )
+        return
 
     elif data.startswith("talento_persona_"):
         person_id   = int(data.split("_")[2])
@@ -229,6 +277,7 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_teclado_generos("talento_genero", GENEROS_MOVIE,
                                           excluir={16, 99})
         )
+        return
 
     elif data.startswith("talento_genero_"):
         genero_id = int(data.split("_")[2])
@@ -249,13 +298,13 @@ async def procesar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text(
                 "😔 Sin resultados para ese actor en ese género.",
                 reply_markup=_kb([
-                    [(f"🔄 Cambiar género",
-                      f"talento_persona_{person_id}")],
+                    [(f"🔄 Cambiar género", f"talento_persona_{person_id}")],
                     BTN_INICIO,
                 ])
             )
             return
         await _enviar_tarjeta(q, res[0], "movie")
+        return
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,60 +317,68 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in estados:
         estados[user_id] = {}
     estado = estados[user_id]
-
-    rama = estado.get("rama")
-    paso = estado.get("paso")
+    rama   = estado.get("rama")
+    paso   = estado.get("paso")
     log.info("TXT user=%s rama=%s paso=%s texto='%s'", user_id, rama, paso, texto)
 
-    # ── Rama Similar ──────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # RAMA 2 — captura de título (NUEVA VERSIÓN)
+    # ══════════════════════════════════════════════════════════════════════════
     if rama == "similar" and paso == "esperando_titulo":
-        estado["paso"] = "buscando"   # evita doble disparo
-
+        estado["paso"] = "buscando"
+        
         msg = await update.message.reply_text(
-            f"🔎 Buscando *{texto}*...", parse_mode="Markdown"
+            f"🔎 Buscando *{texto}*...",
+            parse_mode="Markdown"
         )
         await context.bot.send_chat_action(chat_id=user_id,
                                            action=constants.ChatAction.TYPING)
+        
         async with crear_sesion() as session:
-            candidatos = await engine.buscar_titulo(session, texto)
-        log.info("buscar_titulo('%s') devolvió %d", texto, len(candidatos))
-
+            candidatos = await engine.buscar_titulos(session, texto)
+        
         try:
             await msg.delete()
         except Exception:
             pass
-
+        
         if not candidatos:
-            estado["paso"] = "esperando_titulo"   # reset para que pueda reintentar
+            estado["paso"] = "esperando_titulo"
             await update.message.reply_text(
                 f"😔 No encontré *{texto}* en TMDB.\n\n¿Qué quieres hacer?",
                 parse_mode="Markdown",
                 reply_markup=_kb([
-                    [("🔭 Ir a Descubrimiento",   "similar_ir_descubrir")],
-                    [("✏️ Escribir otro título",   "inicio_similar")],
+                    [("🔭 Ir a Descubrimiento", "similar_ir_descubrir")],
+                    [("✏️ Escribir otro título", "inicio_similar")],
                     BTN_INICIO,
                 ])
             )
             return
-
+        
+        # Guardar candidatos en el estado (opcional, para referencia)
+        estado["candidatos"] = candidatos
+        estado["paso"] = "seleccionando_titulo"
+        
+        # Crear botones para cada candidato
         filas = []
-        for c in candidatos:
-            nombre = c.get("title") or c.get("name") or "Desconocido"
-            anio   = (c.get("release_date") or c.get("first_air_date") or "----")[:4]
-            tipo   = c.get("media_type", "movie")
-            emoji  = "🎬" if tipo == "movie" else "📺"
-            filas.append([(f"{emoji} {nombre} ({anio})",
-                           f"similar_elegir_{tipo}_{c['id']}")])
-        filas.append([("✏️ No es ninguna → otro título", "inicio_similar")])
+        for i, cand in enumerate(candidatos[:8]):  # Máximo 8 para no saturar
+            callback_data = f"similar_sel_{cand['id']}_{cand['media_type']}"
+            filas.append([(cand["display_text"], callback_data)])
+        
+        # Añadir botones de navegación
+        filas.append([("✏️ Buscar otro título", "inicio_similar")])
         filas.append(BTN_INICIO)
-
+        
         await update.message.reply_text(
-            f"✅ *Coincidencias para \"{texto}\"*\n¿Cuál es la que viste?",
+            f"🔍 Encontré {len(candidatos)} coincidencias. ¿A cuál te refieres?",
             reply_markup=_kb(filas),
             parse_mode="Markdown"
         )
+        return
 
-    # ── Rama Talento ──────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # RAMA 3 — captura de nombre del actor
+    # ══════════════════════════════════════════════════════════════════════════
     elif rama == "talento" and paso == "esperando_actor":
         estado.update({"paso": "buscando", "actor_nombre": texto})
 
@@ -330,9 +387,11 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await context.bot.send_chat_action(chat_id=user_id,
                                            action=constants.ChatAction.TYPING)
+
         async with crear_sesion() as session:
             personas = await engine.buscar_persona(session, texto)
-        log.info("buscar_persona('%s') devolvió %d", texto, len(personas))
+
+        log.info("buscar_persona('%s') → %d", texto, len(personas))
 
         try:
             await msg.delete()
@@ -343,7 +402,7 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             estado["paso"] = "esperando_actor"   # reset
             await update.message.reply_text(
                 f"😔 No encontré a *{texto}* en TMDB.\n"
-                "Prueba escribir el nombre en inglés o verifica la ortografía.",
+                "Prueba con el nombre en inglés o verifica la ortografía.",
                 parse_mode="Markdown",
                 reply_markup=_kb([
                     [("✏️ Intentar con otro nombre", "inicio_talento")],
@@ -354,9 +413,9 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         filas = []
         for p in personas:
-            nombre   = p.get("name", "Desconocido")
-            rol      = p.get("known_for_department", "")
-            obras    = ", ".join(
+            nombre = p.get("name", "Desconocido")
+            rol    = p.get("known_for_department", "")
+            obras  = ", ".join(
                 k.get("title") or k.get("name") or ""
                 for k in p.get("known_for", [])[:2]
                 if k.get("title") or k.get("name")
@@ -374,17 +433,18 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_kb(filas),
             parse_mode="Markdown"
         )
+        return
 
     else:
-        # Texto recibido sin contexto
         await update.message.reply_text(
             "Usa el menú para navegar 👇",
             reply_markup=_kb([BTN_INICIO])
         )
+        return
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tarjeta final de resultado
+# Enviar tarjeta (flujos de descubrimiento y talento)
 # ─────────────────────────────────────────────────────────────────────────────
 async def _enviar_tarjeta(q, item: dict, tipo: str):
     async with crear_sesion() as session:
@@ -408,7 +468,7 @@ async def _enviar_tarjeta(q, item: dict, tipo: str):
             await q.message.reply_text(texto, parse_mode="Markdown",
                                         reply_markup=teclado)
     except Exception as e:
-        log.warning("reply_photo falló (%s), fallback a texto", e)
+        log.warning("reply_photo falló (%s), fallback texto", e)
         await q.message.reply_text(texto, parse_mode="Markdown",
                                     reply_markup=teclado)
 

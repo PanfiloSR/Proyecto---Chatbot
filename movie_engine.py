@@ -1,6 +1,7 @@
 # movie_engine.py
 import aiohttp
 import logging
+import json
 from config import TMDB_API_KEY, OMDB_API_KEY
 
 log = logging.getLogger(__name__)
@@ -56,13 +57,9 @@ TEMATICAS_DOC = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Crear sesión HTTP — se usa con "async with crear_sesion() as session:"
+# Sesión HTTP
 # ─────────────────────────────────────────────────────────────────────────────
 def crear_sesion() -> aiohttp.ClientSession:
-    """
-    Devuelve una ClientSession lista para usar con 'async with'.
-    aiohttp.ClientSession ya implementa __aenter__ / __aexit__.
-    """
     return aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=20),
         headers={"Accept": "application/json", "User-Agent": "CineBot/2.0"},
@@ -76,7 +73,7 @@ class MovieEngine:
             raise ValueError("TMDB_API_KEY no está configurada en config.py")
         self.key  = TMDB_API_KEY
         self.omdb = OMDB_API_KEY
-        log.info("MovieEngine inicializado. TMDB key: ...%s", self.key[-4:])
+        log.info("MovieEngine listo. Key: ...%s", self.key[-4:])
 
     # ── GET helper ────────────────────────────────────────────────────────────
     async def _get(self, session: aiohttp.ClientSession,
@@ -84,21 +81,19 @@ class MovieEngine:
         try:
             async with session.get(url, params=params) as r:
                 body = await r.text()
-                log.debug("GET %s → %s | %d bytes", url, r.status, len(body))
+                log.debug("GET %s → %s (%d bytes)", url, r.status, len(body))
                 if r.status == 200:
-                    import json
                     return json.loads(body)
-                log.warning("TMDB %s status=%s cuerpo=%s", url, r.status, body[:300])
+                log.warning("TMDB %s → status %s: %s", url, r.status, body[:200])
         except aiohttp.ServerTimeoutError:
-            log.error("Timeout en GET %s", url)
+            log.error("Timeout: %s", url)
         except aiohttp.ClientConnectorError as e:
-            log.error("Sin conexión para GET %s: %s", url, e)
+            log.error("Sin conexión: %s — %s", url, e)
         except Exception as e:
-            log.error("Error inesperado GET %s: %s", url, e, exc_info=True)
+            log.error("Error GET %s: %s", url, e, exc_info=True)
         return {}
 
     def _p(self, extra: dict | None = None) -> dict:
-        """Parámetros base TMDB: api_key + idioma español."""
         base = {"api_key": self.key, "language": "es-ES"}
         if extra:
             base.update(extra)
@@ -140,74 +135,117 @@ class MovieEngine:
             data = await self._get(session, url, params)
             res  = data.get("results", [])
 
-        log.info("descubrir(%s, gid=%s) → %d resultados", tipo, genero_id, len(res))
+        log.info("descubrir(%s, gid=%s) → %d", tipo, genero_id, len(res))
         return res
 
     # ═════════════════════════════════════════════════════════════════════════
-    # RAMA 2 — SIMILITUD
+    # RAMA 2 — SIMILITUD (NUEVA VERSIÓN CON SELECCIÓN)
     # ═════════════════════════════════════════════════════════════════════════
-    async def buscar_titulo(self, session: aiohttp.ClientSession,
-                            texto: str) -> list:
+    
+    async def buscar_titulos(self, session: aiohttp.ClientSession, texto: str) -> list:
         """
-        Busca en /search/multi.
-        Intenta primero en español; si hay menos de 3 resultados,
-        repite en inglés (útil para títulos originales).
+        Busca títulos que coincidan con el texto y devuelve una lista de candidatos
+        para que el usuario elija.
         """
-        url = f"{TMDB_BASE}/search/multi"
+        url_search = f"{TMDB_BASE}/search/multi"
+        candidatos = []
+        
+        # Buscar en español primero, luego inglés
+        for lang in ("es-ES", "en-US"):
+            params = {"api_key": self.key, "language": lang,
+                      "query": texto, "page": 1, "include_adult": "false"}
+            data = await self._get(session, url_search, params)
+            raw = [r for r in data.get("results", [])
+                   if r.get("media_type") in ("movie", "tv")]
+            ids_ya = {c["id"] for c in candidatos}
+            for r in raw:
+                if r["id"] not in ids_ya:
+                    # Añadir información adicional para mostrar
+                    titulo = r.get("title") or r.get("name") or "Desconocido"
+                    anio = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+                    media_type = "🎬 Película" if r.get("media_type") == "movie" else "📺 Serie"
+                    r["display_text"] = f"{media_type} • {titulo} ({anio})"
+                    candidatos.append(r)
+            if candidatos:
+                break
+        
+        log.info("buscar_titulos('%s') → %d resultados", texto, len(candidatos))
+        return candidatos[:10]  # Limitar a 10 resultados
 
-        # --- intento 1: español ---
-        data = await self._get(session, url, self._p({
-            "query": texto, "page": 1, "include_adult": "false"
-        }))
-        res = [r for r in data.get("results", [])
-               if r.get("media_type") in ("movie", "tv")]
-
-        # --- intento 2: inglés (para títulos originales) ---
-        if len(res) < 3:
-            params_en = {"api_key": self.key, "language": "en-US",
-                         "query": texto, "page": 1, "include_adult": "false"}
-            data_en = await self._get(session, url, params_en)
-            ids_ya  = {r["id"] for r in res}
-            for r in data_en.get("results", []):
-                if r.get("media_type") in ("movie", "tv") and r["id"] not in ids_ya:
-                    res.append(r)
-
-        log.info("buscar_titulo('%s') → %d candidatos", texto, len(res))
-        return res[:6]
-
-    async def obtener_recomendaciones(self, session: aiohttp.ClientSession,
-                                      tipo: str, tmdb_id: int) -> list:
-        params = self._p({"page": 1})
-        data_r = await self._get(session, f"{TMDB_BASE}/{tipo}/{tmdb_id}/recommendations", params)
-        res    = data_r.get("results", [])
-
-        if len(res) < 5:
-            data_s = await self._get(session, f"{TMDB_BASE}/{tipo}/{tmdb_id}/similar", params)
-            ids    = {r["id"] for r in res}
-            for r in data_s.get("results", []):
-                if r["id"] not in ids:
-                    res.append(r)
-
-        log.info("recomendaciones(%s, %s) → %d", tipo, tmdb_id, len(res))
-        return res
+    async def recomendar_por_id(self, session: aiohttp.ClientSession,
+                                tmdb_id: int, tipo: str) -> dict | None:
+        """
+        Recomienda contenido similar basado en el ID de una película/serie específica.
+        """
+        # Obtener detalles de la semilla
+        detalles = await self.obtener_detalle(session, tipo, tmdb_id)
+        s_titulo = detalles.get("title") or detalles.get("name") or "Desconocido"
+        s_anio = (detalles.get("release_date") or detalles.get("first_air_date") or "")[:4]
+        
+        log.info("Recomendando para: '%s' (%s) id=%s tipo=%s", s_titulo, s_anio, tmdb_id, tipo)
+        
+        # Obtener keywords de la semilla
+        data_kw = await self._get(session, f"{TMDB_BASE}/{tipo}/{tmdb_id}/keywords",
+                                  {"api_key": self.key})
+        kw_lista = data_kw.get("keywords") or data_kw.get("results") or []
+        kw_ids = [str(k["id"]) for k in kw_lista[:8]]
+        log.info("Keywords: %s", [k["name"] for k in kw_lista[:8]])
+        
+        recomendaciones = []
+        
+        # Discover por keywords
+        if kw_ids:
+            for kw_chunk in [",".join(kw_ids), "|".join(kw_ids[:4])]:
+                params_d = self._p({
+                    "with_keywords": kw_chunk,
+                    "sort_by": "vote_average.desc",
+                    "vote_count.gte": 30,
+                    "page": 1,
+                    "without_genres": "16",
+                })
+                data_d = await self._get(session, f"{TMDB_BASE}/discover/{tipo}", params_d)
+                pool = [r for r in data_d.get("results", []) if r["id"] != tmdb_id]
+                if pool:
+                    recomendaciones = pool
+                    log.info("Keywords discover → %d resultados", len(pool))
+                    break
+        
+        # Fallback a recommendations
+        if len(recomendaciones) < 3:
+            data_rec = await self._get(session,
+                                       f"{TMDB_BASE}/{tipo}/{tmdb_id}/recommendations",
+                                       self._p({"page": 1}))
+            ids_ya = {r["id"] for r in recomendaciones}
+            for r in data_rec.get("results", []):
+                if r["id"] not in ids_ya and r["id"] != tmdb_id:
+                    recomendaciones.append(r)
+            log.info("Tras fallback: %d total", len(recomendaciones))
+        
+        if not recomendaciones:
+            log.warning("Sin recomendaciones para '%s'", s_titulo)
+            return None
+        
+        top3 = sorted(recomendaciones,
+                      key=lambda x: x.get("vote_average", 0), reverse=True)[:3]
+        
+        return {
+            "semilla": {"titulo": s_titulo, "anio": s_anio, "tipo": tipo, "id": tmdb_id},
+            "recomendaciones": top3,
+            "tipo": tipo,
+        }
 
     # ═════════════════════════════════════════════════════════════════════════
     # RAMA 3 — TALENTO
     # ═════════════════════════════════════════════════════════════════════════
     async def buscar_persona(self, session: aiohttp.ClientSession,
                              nombre: str) -> list:
-        """
-        /search/person — prueba español e inglés para mayor cobertura.
-        """
         url = f"{TMDB_BASE}/search/person"
 
-        # intento 1: español
         data = await self._get(session, url, self._p({
             "query": nombre, "page": 1, "include_adult": "false"
         }))
         res = data.get("results", [])
 
-        # intento 2: inglés
         if len(res) < 2:
             params_en = {"api_key": self.key, "language": "en-US",
                          "query": nombre, "page": 1, "include_adult": "false"}
@@ -217,7 +255,7 @@ class MovieEngine:
                 if r["id"] not in ids_ya:
                     res.append(r)
 
-        log.info("buscar_persona('%s') → %d resultados", nombre, len(res))
+        log.info("buscar_persona('%s') → %d", nombre, len(res))
         return res[:5]
 
     async def descubrir_por_actor_y_genero(self, session: aiohttp.ClientSession,
@@ -244,7 +282,7 @@ class MovieEngine:
         return res
 
     # ═════════════════════════════════════════════════════════════════════════
-    # DETALLE COMPLETO DE UNA OBRA
+    # DETALLE COMPLETO
     # ═════════════════════════════════════════════════════════════════════════
     async def obtener_detalle(self, session: aiohttp.ClientSession,
                               tipo: str, tmdb_id: int) -> dict:
@@ -259,9 +297,6 @@ class MovieEngine:
                            titulo_original: str,
                            titulo_es: str = "",
                            anio: str = "") -> str:
-        """
-        Hasta 4 intentos: original+año → original → español+año → español.
-        """
         async def _q(t: str, y: str = "") -> dict | None:
             for omdb_type in ("movie", "series"):
                 p = {"apikey": self.omdb, "t": t, "type": omdb_type}
@@ -274,7 +309,7 @@ class MovieEngine:
                             if d.get("Response") == "True":
                                 return d
                 except Exception as e:
-                    log.warning("OMDb error '%s': %s", t, e)
+                    log.warning("OMDb '%s': %s", t, e)
             return None
 
         titulos = [(titulo_original, anio), (titulo_original, "")]
@@ -302,8 +337,7 @@ class MovieEngine:
     # ═════════════════════════════════════════════════════════════════════════
     async def construir_tarjeta(self, session: aiohttp.ClientSession,
                                 item: dict, tipo: str = "movie") -> dict:
-        d = await self.obtener_detalle(session, tipo, item["id"])
-
+        d        = await self.obtener_detalle(session, tipo, item["id"])
         titulo   = d.get("title") or d.get("name") or "Desconocido"
         tit_orig = d.get("original_title") or d.get("original_name") or titulo
         anio     = (d.get("release_date") or d.get("first_air_date") or "")[:4]
